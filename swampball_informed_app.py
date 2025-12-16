@@ -272,8 +272,8 @@ def generate_informed_sets(
 
         rows.append({
             "Set": 0,  # filled later
-            "W1": whites[0], "W2": whites[1], "W3": whites[2], "W4": whites[3], "W5": whites[4],
-            "PB": pb,
+            "Whites": " ".join(f"{n:02d}" for n in whites),
+            "Powerball": f"{pb:02d}",
             "WhiteSum": sum(whites),
             "OddCount": sum(n % 2 for n in whites),
             "FreqScore": freq_score,
