@@ -12,7 +12,7 @@ import streamlit as st
 
 
 # -----------------------------
-# Helpers: parse dataset
+# Load + parse Powerball history
 # -----------------------------
 def parse_numbers(s: str) -> Tuple[List[int], int]:
     nums = [int(x) for x in str(s).split()]
@@ -35,27 +35,35 @@ def load_powerball_csv(path_or_file) -> pd.DataFrame:
     df["PB"] = parsed.apply(lambda x: x[1])
     df["MaxW"] = df["W"].apply(max)
 
-    # Filter to modern game format: white 1–69 and PB 1–26
-    # (Older era had different ranges; this dataset includes those.)
+    # Keep modern 69/26 era only
     df = df[(df["PB"] <= 26) & (df["MaxW"] <= 69)].copy()
 
-    # Expand whites into columns
     w = np.vstack(df["W"].to_list())
     df["W1"], df["W2"], df["W3"], df["W4"], df["W5"] = w.T
-    df["WhiteSum"] = w.sum(axis=1)
-    df["OddCount"] = (w % 2).sum(axis=1)
-    df["LowCount"] = (w <= 12).sum(axis=1)
-    df["RunMax"] = [longest_consecutive_run(row.tolist()) for row in w]
-
     return df.sort_values("DrawDate")
 
 
+def frequency_tables(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+    whites = np.vstack(df[["W1", "W2", "W3", "W4", "W5"]].to_numpy())
+    pb = df["PB"].to_numpy()
+
+    wc = pd.Series(whites.flatten()).value_counts().sort_index().reindex(range(1, 70), fill_value=0)
+    pc = pd.Series(pb).value_counts().sort_index().reindex(range(1, 27), fill_value=0)
+    return wc, pc
+
+
+def make_weights(counts: pd.Series, alpha: float = 1.0) -> np.ndarray:
+    # alpha > 1 pushes "hot" numbers, alpha < 1 flattens
+    x = counts.to_numpy(dtype=float) + 1.0  # smoothing
+    x = np.power(x, alpha)
+    return x / x.sum()
+
+
 # -----------------------------
-# Date gematria / numerology
+# Date gematria (lightweight)
 # -----------------------------
 def digitsum(n: int) -> int:
-    n = abs(int(n))
-    return sum(int(c) for c in str(n))
+    return sum(int(c) for c in str(abs(int(n))))
 
 
 def digital_root(n: int) -> int:
@@ -82,48 +90,34 @@ def date_features(d: DateType) -> Dict[str, int]:
     ymd = y * 10000 + m * 100 + dd
     doy = day_of_year(d)
     dleft = days_in_year(y) - doy
-
     mmdd = m * 100 + dd
-    ddmm = dd * 100 + m
 
-    feats = {
-        "year": y,
-        "month": m,
-        "day": dd,
+    return {
         "yyyymmdd": ymd,
         "ds_yyyymmdd": digitsum(ymd),
         "dr_yyyymmdd": digital_root(ymd),
         "mmdd": mmdd,
-        "ddmm": ddmm,
-        "ds_mmdd": digitsum(mmdd),
         "dr_mmdd": digital_root(mmdd),
         "doy": doy,
-        "ds_doy": digitsum(doy),
         "dr_doy": digital_root(doy),
         "days_left": dleft,
-        "ds_days_left": digitsum(dleft),
         "dr_days_left": digital_root(dleft),
         "md": m + dd,
-        "ds_md": digitsum(m + dd),
         "dr_md": digital_root(m + dd),
-        "m_times_d": m * dd,
-        "ds_m_times_d": digitsum(m * dd),
-        "dr_m_times_d": digital_root(m * dd),
     }
-    return feats
 
 
 # -----------------------------
-# Structural constraints
+# Constraints (kept simple)
 # -----------------------------
 @dataclass
 class Constraints:
     odd_min: int = 1
     odd_max: int = 4
-    sum_min: int = 110
-    sum_max: int = 225
-    low_max: int = 3
-    run_max: int = 2
+    sum_min: int = 105
+    sum_max: int = 230
+    low_max: int = 3          # count <= 12
+    run_max: int = 2          # max consecutive run
 
 
 def longest_consecutive_run(nums: List[int]) -> int:
@@ -154,103 +148,39 @@ def passes_constraints(whites: List[int], c: Constraints) -> bool:
 
 
 # -----------------------------
-# Frequency + scoring
+# Generator (simple + "informed")
 # -----------------------------
-def frequency_tables(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
-    whites = np.vstack(df[["W1", "W2", "W3", "W4", "W5"]].to_numpy())
-    pb = df["PB"].to_numpy()
-
-    wc = pd.Series(whites.flatten()).value_counts().sort_index()
-    pc = pd.Series(pb).value_counts().sort_index()
-
-    wc = wc.reindex(range(1, 70), fill_value=0)
-    pc = pc.reindex(range(1, 27), fill_value=0)
-    return wc, pc
+def stable_seed(target_date: DateType, salt: str = "") -> int:
+    feats = date_features(target_date)
+    blob = f"{target_date.isoformat()}|{salt}|{feats}".encode("utf-8")
+    return int(hashlib.sha256(blob).hexdigest()[:16], 16)
 
 
-def make_weights(counts: pd.Series, alpha: float = 1.0) -> np.ndarray:
-    x = counts.to_numpy(dtype=float) + 1.0  # +1 smoothing
-    x = np.power(x, alpha)
-    return x / x.sum()
-
-
-def gematria_match_score(whites: List[int], pb: int, feats: Dict[str, int]) -> float:
-    raw_vals = [
-        feats["dr_yyyymmdd"],
-        feats["ds_yyyymmdd"],
-        feats["dr_mmdd"],
-        feats["ds_mmdd"],
-        feats["doy"],
-        feats["dr_doy"],
-        feats["md"],
-        feats["dr_md"],
-        feats["m_times_d"],
-        feats["dr_m_times_d"],
-    ]
-
-    reduced_white = [(v - 1) % 69 + 1 for v in raw_vals]
-    reduced_pb = [(v - 1) % 26 + 1 for v in raw_vals]
-
-    white_set = set(whites)
-    score = 0.0
-
-    score += 1.5 * sum(1 for v in reduced_white if v in white_set)
-    score += 1.0 if pb in set(reduced_pb) else 0.0
-    score += 0.75 if feats["dr_yyyymmdd"] in white_set else 0.0
-
-    return score
-
-
-def structural_score(whites: List[int], c: Constraints) -> float:
-    s = sum(whites)
-    odd = sum(n % 2 for n in whites)
-    low = sum(1 for n in whites if n <= 12)
-    run = longest_consecutive_run(whites)
-
-    sum_center = (c.sum_min + c.sum_max) / 2.0
-    sum_span = max(1.0, (c.sum_max - c.sum_min) / 2.0)
-    sum_score = 1.0 - min(1.0, abs(s - sum_center) / (sum_span * 1.25))
-
-    odd_center = (c.odd_min + c.odd_max) / 2.0
-    odd_span = max(1.0, (c.odd_max - c.odd_min) / 2.0)
-    odd_score = 1.0 - min(1.0, abs(odd - odd_center) / (odd_span * 1.25))
-
-    low_score = 1.0 - min(1.0, max(0, low - 2) / 3.0)
-    run_score = 1.0 - min(1.0, max(0, run - 2) / 3.0)
-
-    return 2.0 * sum_score + 1.0 * odd_score + 0.5 * low_score + 0.5 * run_score
-
-
-def generate_informed_sets(
-    df: pd.DataFrame,
+def generate_sets(
+    df_history: pd.DataFrame,
     target_date: DateType,
     n_sets: int,
-    candidates: int,
-    c: Constraints,
     alpha_white: float,
     alpha_pb: float,
-    w_freq: float,
-    w_struct: float,
-    w_gem: float,
-    seed_salt: str,
+    salt: str,
+    max_attempts: int = 200000,
 ) -> Tuple[pd.DataFrame, Dict[str, int], pd.Series, pd.Series]:
-    wc, pc = frequency_tables(df)
+    wc, pc = frequency_tables(df_history)
     w_weights = make_weights(wc, alpha=alpha_white)
     pb_weights = make_weights(pc, alpha=alpha_pb)
 
     feats = date_features(target_date)
-
-    blob = f"{target_date.isoformat()}|{seed_salt}|{alpha_white}|{alpha_pb}|{w_freq}|{w_struct}|{w_gem}|{c}".encode("utf-8")
-    seed = int(hashlib.sha256(blob).hexdigest()[:16], 16)
+    seed = stable_seed(target_date, salt=salt)
     rng = np.random.default_rng(seed)
-
-    w_logp = np.log(w_weights + 1e-12)
-    pb_logp = np.log(pb_weights + 1e-12)
 
     seen = set()
     rows = []
+    attempts = 0
+    c = Constraints()
 
-    for _ in range(candidates):
+    while len(rows) < n_sets and attempts < max_attempts:
+        attempts += 1
+
         whites = rng.choice(np.arange(1, 70), size=5, replace=False, p=w_weights).tolist()
         whites.sort()
 
@@ -264,145 +194,115 @@ def generate_informed_sets(
             continue
         seen.add(key)
 
-        freq_score = float(sum(w_logp[n - 1] for n in whites) + pb_logp[pb - 1])
-        struct_score = float(structural_score(whites, c))
-        gem_score = float(gematria_match_score(whites, pb, feats))
-
-        total = w_freq * freq_score + w_struct * struct_score + w_gem * gem_score
-
         rows.append({
-            "Set": 0,  # filled later
+            "Set": len(rows) + 1,
             "Whites": " ".join(f"{n:02d}" for n in whites),
             "Powerball": f"{pb:02d}",
-            "WhiteSum": sum(whites),
-            "OddCount": sum(n % 2 for n in whites),
-            "FreqScore": freq_score,
-            "StructScore": struct_score,
-            "GematriaScore": gem_score,
-            "TotalScore": total,
         })
 
-    if not rows:
-        raise RuntimeError("No candidates passed constraints. Loosen constraints or increase candidates.")
+    if len(rows) < n_sets:
+        raise RuntimeError("Couldn’t generate enough sets under constraints. Try again or lower set count.")
 
-    out = pd.DataFrame(rows).sort_values("TotalScore", ascending=False).head(n_sets).reset_index(drop=True)
-    out["Set"] = np.arange(1, len(out) + 1)
-    return out, feats, wc, pc
+    return pd.DataFrame(rows), feats, wc, pc
+
+
+def rank_numbers_from_output(out: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    white_counts = {}
+    pb_counts = {}
+
+    for _, r in out.iterrows():
+        whites = [int(x) for x in str(r["Whites"]).split()]
+        pb = int(r["Powerball"])
+
+        for w in whites:
+            white_counts[w] = white_counts.get(w, 0) + 1
+        pb_counts[pb] = pb_counts.get(pb, 0) + 1
+
+    wdf = (pd.DataFrame({"White": list(white_counts.keys()), "Count": list(white_counts.values())})
+             .sort_values(["Count", "White"], ascending=[False, True])
+             .reset_index(drop=True))
+
+    pdf = (pd.DataFrame({"Powerball": list(pb_counts.keys()), "Count": list(pb_counts.values())})
+             .sort_values(["Count", "Powerball"], ascending=[False, True])
+             .reset_index(drop=True))
+
+    return wdf, pdf
 
 
 # -----------------------------
-# Streamlit UI
+# Streamlit UI (simple)
 # -----------------------------
-st.set_page_config(page_title="Powerball Informed Builder", layout="wide")
-st.title("Powerball Informed Builder (Frequency + Structure + Date Gematria)")
-
+st.set_page_config(page_title="Swampball Simple", layout="centered")
+st.title("Swampball Simple")
 st.caption(
-    "This app does *not* predict lottery outcomes. It generates consistent, date-shaped picks using historical frequency + realistic draw structure + date-gematria alignment."
+    "Pick a date → generate 20/50/100 informed sets. "
+    "Then optionally scrub the output to see which numbers showed up most in *this batch*."
 )
 
-with st.sidebar:
-    st.header("Data")
-    uploaded = st.file_uploader("Upload Powerball history CSV", type=["csv"])
-    st.write("Expected columns: **Draw Date**, **Winning Numbers** (5 whites + PB).")
-
-    st.divider()
-    st.header("Target")
-    target_date = st.date_input("Target date", value=dt.date(2025, 12, 17))
-    n_sets = st.slider("How many sets to output?", 5, 50, 20, 1)
-    candidates = st.slider("How many candidates to search?", 500, 50000, 12000, 500)
-
-    seed_salt = st.text_input("Optional salt (keeps runs stable)", value="lil_art_hoe")
-
-    st.divider()
-    st.header("Bias controls")
-    alpha_white = st.slider("White frequency emphasis", 0.2, 3.0, 1.1, 0.1)
-    alpha_pb = st.slider("Powerball frequency emphasis", 0.2, 3.0, 1.1, 0.1)
-
-    w_freq = st.slider("Weight: frequency", 0.0, 5.0, 1.2, 0.1)
-    w_struct = st.slider("Weight: structure", 0.0, 5.0, 2.0, 0.1)
-    w_gem = st.slider("Weight: date gematria", 0.0, 5.0, 1.0, 0.1)
-
-    st.divider()
-    st.header("Structural constraints")
-    c = Constraints(
-        odd_min=st.slider("Odd min", 0, 5, 1),
-        odd_max=st.slider("Odd max", 0, 5, 4),
-        sum_min=st.slider("White sum min", 50, 260, 110, 1),
-        sum_max=st.slider("White sum max", 80, 300, 225, 1),
-        low_max=st.slider("Max count ≤12", 0, 5, 3),
-        run_max=st.slider("Max consecutive run", 1, 5, 2),
-    )
-
-    run_btn = st.button("Generate", type="primary")
-
+uploaded = st.file_uploader("Upload Powerball history CSV", type=["csv"])
 if not uploaded:
-    st.info("Upload your CSV (like the one you already have) to enable generation.")
+    st.info("Upload your Powerball history CSV first.")
     st.stop()
 
 df = load_powerball_csv(uploaded)
 
-col1, col2 = st.columns([1.2, 1])
+target_date = st.date_input("Target date", value=dt.date(2025, 12, 17))
+n_sets = st.radio("How many sets?", options=[20, 50, 100], horizontal=True)
+salt = st.text_input("Optional salt (keeps results stable)", value="lil_art_hoe")
 
-with col1:
-    st.subheader("Modern-format dataset summary")
-    st.write(f"Rows (modern 69/26 era): **{len(df):,}**")
-    st.write(f"Date range: **{df['DrawDate'].min().date()} → {df['DrawDate'].max().date()}**")
-    st.dataframe(df[["Draw Date", "Winning Numbers", "PB", "WhiteSum", "OddCount"]].tail(10), use_container_width=True)
+with st.expander("Optional tuning (leave as-is if you want it simple)"):
+    alpha_white = st.slider("White frequency bias", 0.2, 3.0, 1.1, 0.1)
+    alpha_pb = st.slider("Powerball frequency bias", 0.2, 3.0, 1.1, 0.1)
 
-with col2:
-    st.subheader("Typical structure (from your dataset)")
-    st.write("These guide the default constraints:")
-    st.write(f"- Median white sum: **{int(df['WhiteSum'].median())}**")
-    st.write(f"- 10th–90th percentile white sum: **{int(df['WhiteSum'].quantile(0.10))} – {int(df['WhiteSum'].quantile(0.90))}**")
-    st.write(f"- Most common odd counts: **{df['OddCount'].value_counts().head(3).to_dict()}**")
+gen = st.button("Generate", type="primary")
 
-if run_btn:
-    try:
-        out, feats, wc, pc = generate_informed_sets(
-            df=df,
-            target_date=target_date,
-            n_sets=n_sets,
-            candidates=candidates,
-            c=c,
-            alpha_white=alpha_white,
-            alpha_pb=alpha_pb,
-            w_freq=w_freq,
-            w_struct=w_struct,
-            w_gem=w_gem,
-            seed_salt=seed_salt.strip(),
+if gen:
+    out, feats, _, _ = generate_sets(
+        df_history=df,
+        target_date=target_date,
+        n_sets=int(n_sets),
+        alpha_white=float(alpha_white),
+        alpha_pb=float(alpha_pb),
+        salt=salt.strip(),
+    )
+
+    st.subheader(f"Sets for {target_date.isoformat()}")
+    st.dataframe(out, hide_index=True, use_container_width=True)
+
+    st.download_button(
+        "Download sets (CSV)",
+        data=out.to_csv(index=False).encode("utf-8"),
+        file_name=f"swampball_sets_{target_date.isoformat()}_{n_sets}.csv",
+        mime="text/csv",
+    )
+
+    st.divider()
+    st.subheader("Scrub / Rank numbers in this output")
+
+    scrub = st.toggle("Show ranked counts from generated output", value=True)
+    if scrub:
+        wdf, pdf = rank_numbers_from_output(out)
+
+        st.write("Most common **white balls** in this generated batch:")
+        st.dataframe(wdf, hide_index=True, use_container_width=True)
+
+        st.write("Most common **Powerballs** in this generated batch:")
+        st.dataframe(pdf, hide_index=True, use_container_width=True)
+
+        ranked = pd.concat(
+            [
+                wdf.assign(Type="White").rename(columns={"White": "Number"}),
+                pdf.assign(Type="Powerball").rename(columns={"Powerball": "Number"}),
+            ],
+            ignore_index=True,
+        )[["Type", "Number", "Count"]]
+
+        st.download_button(
+            "Download ranked counts (CSV)",
+            data=ranked.to_csv(index=False).encode("utf-8"),
+            file_name=f"swampball_ranked_{target_date.isoformat()}_{n_sets}.csv",
+            mime="text/csv",
         )
 
-        st.divider()
-        a, b = st.columns([1.3, 1])
-
-        with a:
-            st.subheader(f"Top {len(out)} informed sets for {target_date.isoformat()}")
-            st.dataframe(out, use_container_width=True, hide_index=True)
-
-            csv_bytes = out.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "Download sets as CSV",
-                data=csv_bytes,
-                file_name=f"powerball_informed_{target_date.isoformat()}.csv",
-                mime="text/csv",
-            )
-
-        with b:
-            st.subheader("Date gematria features (curated)")
-            show = ["yyyymmdd", "ds_yyyymmdd", "dr_yyyymmdd", "mmdd", "dr_mmdd", "doy", "dr_doy", "days_left", "md", "dr_md", "m_times_d", "dr_m_times_d"]
-            st.json({k: feats[k] for k in show})
-
-            st.subheader("Frequency snapshot (top 10)")
-            topw = wc.sort_values(ascending=False).head(10).rename("WhiteCount").reset_index().rename(columns={"index": "White"})
-            topp = pc.sort_values(ascending=False).head(10).rename("PBCount").reset_index().rename(columns={"index": "PB"})
-            st.write("White balls:")
-            st.dataframe(topw, use_container_width=True, hide_index=True)
-            st.write("Powerballs:")
-            st.dataframe(topp, use_container_width=True, hide_index=True)
-
-    except Exception as e:
-        st.error(str(e))
-        st.info("Try loosening constraints (sum range / run limit) or increasing candidate search.")
-else:
-    st.write("Upload your CSV, set your options in the sidebar, then click **Generate**.")
-    st.caption("Tip: Same settings => same output.")
+    with st.expander("Date gematria snapshot"):
+        st.json(feats)
